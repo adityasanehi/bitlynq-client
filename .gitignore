@@ -1,0 +1,220 @@
+# ----------------------------------------
+# Project Docs and Metadata
+# ----------------------------------------
+claude.md
+*.md.backup
+
+# ----------------------------------------
+# Environment Files
+# ----------------------------------------
+.env
+.env.*
+.env.*.local
+.env.docker
+
+# ----------------------------------------
+# Database Files
+# ----------------------------------------
+*.db
+*.sqlite*
+*.db-*
+data/
+
+# ----------------------------------------
+# Logs and Runtime Files
+# ----------------------------------------
+*.log
+*.log.*
+logs/
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# ----------------------------------------
+# Python
+# ----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+htmlcov/
+.tox/
+.nox/
+.coverage*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.pybuilder/
+target/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+local_settings.py
+db.sqlite3*
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+profile_default/
+ipython_config.py
+.python-version
+Pipfile.lock
+poetry.lock
+.pdm.toml
+__pypackages__/
+celerybeat-*
+.pyre/
+.pytype/
+cython_debug/
+
+# ----------------------------------------
+# Jupyter Notebooks
+# ----------------------------------------
+.ipynb_checkpoints
+
+# ----------------------------------------
+# IDE Configs
+# ----------------------------------------
+.idea/
+.vscode/
+.spyderproject
+.spyproject
+.ropeproject
+
+# ----------------------------------------
+# Node.js
+# ----------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+*.tgz
+.yarn-integrity
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.eslintcache
+.stylelintcache
+.rpt2_cache/
+.rts2_cache_*/
+.nyc_output/
+coverage/
+.grunt/
+bower_components/
+jspm_packages/
+web_modules/
+*.tsbuildinfo
+.npm
+
+# ----------------------------------------
+# Frontend Frameworks
+# ----------------------------------------
+.next/
+out/
+.nuxt/
+dist/
+.cache/
+public/
+.vuepress/dist/
+.temp/
+.docusaurus/
+.serverless/
+.fusebox/
+
+# ----------------------------------------
+# OS-Specific: macOS
+# ----------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# ----------------------------------------
+# OS-Specific: Windows
+# ----------------------------------------
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ----------------------------------------
+# Editors / Swaps / Backups
+# ----------------------------------------
+*.swp
+*.swo
+*~
+*.bak
+*.backup
+
+# ----------------------------------------
+# Docker
+# ----------------------------------------
+.dockerignore
+
+# ----------------------------------------
+# Cloud Credentials / Secrets
+# ----------------------------------------
+credentials/
+*.json
+*.pem
+*.key
+*.p12
+*.p8
+secrets/
+private/
+personal/
+
+# ----------------------------------------
+# Torrent Files
+# ----------------------------------------
+*.torrent
+downloads/
+session_state/
+resume_data/
+
+# ----------------------------------------
+# Cloud Upload Cache
+# ----------------------------------------
+upload_cache/
+pending_uploads/
+
+# ----------------------------------------
+# Misc Temp Files
+# ----------------------------------------
+tmp/
+temp/
+*.tmp
+*.temp
+
+*.sh
+*.sh.swp

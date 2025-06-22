@@ -1,0 +1,1050 @@
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+import asyncio
+import json
+import logging
+from typing import List, Optional
+from contextlib import asynccontextmanager
+import time 
+import platform 
+
+from torrents import TorrentManager
+from models import TorrentInfo, TorrentStatus, CloudProvider, PeerInfo
+from database import Database
+from cloud.gdrive import GoogleDriveUploader
+from cloud.s3 import S3Uploader
+from cloud.webdav import WebDAVUploader
+from lan_sync import LANSync
+from config import Settings
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize components
+settings = Settings()
+database = Database()
+torrent_manager = TorrentManager(database)
+lan_sync = LANSync()
+
+# Cloud uploaders
+uploaders = {
+    CloudProvider.GDRIVE: GoogleDriveUploader(),
+    CloudProvider.S3: S3Uploader(),
+    CloudProvider.WEBDAV: WebDAVUploader()
+}
+
+# WebSocket connections
+active_connections: List[WebSocket] = []
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup
+    await database.init()
+    await torrent_manager.start()
+    await lan_sync.start()
+    
+    # Start background tasks
+    asyncio.create_task(status_broadcaster())
+    
+    yield
+    
+    # Shutdown
+    await torrent_manager.stop()
+    await lan_sync.stop()
+    await database.close()
+
+app = FastAPI(
+    title="Hybrid Torrent Client",
+    description="Privacy-respecting torrent client with cloud sync and LAN sharing",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Security
+security = HTTPBearer(auto_error=False)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Simple token verification (enhance with JWT in production)"""
+    if not credentials or credentials.credentials != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+# WebSocket connection manager
+async def broadcast_message(message: dict):
+    """Broadcast message to all connected clients"""
+    if active_connections:
+        disconnected = []
+        message_str = json.dumps(message, default=str)  # Handle datetime serialization
+        
+        for connection in active_connections:
+            try:
+                await connection.send_text(message_str)
+            except Exception as e:
+                logger.debug(f"Failed to send to WebSocket client: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected clients
+        for conn in disconnected:
+            if conn in active_connections:
+                active_connections.remove(conn)
+                logger.debug(f"Removed disconnected WebSocket client. Active: {len(active_connections)}")
+
+async def status_broadcaster():
+    """Background task to broadcast torrent status updates"""
+    last_broadcast = {}
+    
+    while True:
+        try:
+            torrents = await torrent_manager.get_all_torrents()
+            current_data = {}
+            
+            # Check if any torrent data has changed
+            changed_torrents = []
+            for torrent in torrents:
+                torrent_dict = {
+                    "hash": torrent.hash,
+                    "name": torrent.name,
+                    "size": torrent.size,
+                    "status": torrent.status.value,
+                    "progress": torrent.progress,
+                    "download_rate": torrent.download_rate,
+                    "upload_rate": torrent.upload_rate,
+                    "downloaded": torrent.downloaded,
+                    "uploaded": torrent.uploaded,
+                    "peers": torrent.peers,
+                    "seeds": torrent.seeds,
+                    "eta": torrent.eta,
+                    "save_path": torrent.save_path,
+                    "added_time": torrent.added_time.isoformat() if torrent.added_time else None,
+                    "completed_time": torrent.completed_time.isoformat() if torrent.completed_time else None
+                }
+                
+                current_data[torrent.hash] = torrent_dict
+                
+                # Check if this torrent's data has changed
+                if (torrent.hash not in last_broadcast or 
+                    last_broadcast[torrent.hash] != torrent_dict):
+                    changed_torrents.append(torrent_dict)
+            
+            # Only broadcast if there are changes or new connections
+            if changed_torrents or len(active_connections) > len(last_broadcast.get('_connections', [])):
+                # Get bandwidth stats
+                bandwidth_stats = await torrent_manager.get_bandwidth_stats()
+                
+                message = {
+                    "type": "torrent_status_update",
+                    "data": {
+                        "torrents": list(current_data.values()),
+                        "stats": bandwidth_stats,
+                        "timestamp": asyncio.get_event_loop().time()
+                    }
+                }
+                
+                await broadcast_message(message)
+                
+                # Update last broadcast data
+                last_broadcast = current_data.copy()
+                last_broadcast['_connections'] = list(range(len(active_connections)))
+            
+            await asyncio.sleep(2)  # Update every 2 seconds
+            
+        except Exception as e:
+            logger.error(f"Error in status broadcaster: {e}")
+            await asyncio.sleep(5)
+
+# Routes
+
+@app.get("/")
+async def root():
+    return {"message": "Hybrid Torrent Client API", "version": "1.0.0"}
+
+@app.get("/health")
+async def health_check():
+    torrent_count = len(await torrent_manager.get_all_torrents())
+    bandwidth_stats = await torrent_manager.get_bandwidth_stats()
+    
+    return {
+        "status": "healthy", 
+        "torrents_active": torrent_count,
+        "download_rate": bandwidth_stats.get("download_rate", 0),
+        "upload_rate": bandwidth_stats.get("upload_rate", 0),
+        "websocket_connections": len(active_connections)
+    }
+
+# Torrent endpoints
+
+@app.post("/torrent/add", response_model=TorrentInfo)
+async def add_torrent(
+    magnet: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    token: str = Depends(verify_token)
+):
+    """Add a torrent via magnet link or file upload"""
+    if not magnet and not file:
+        raise HTTPException(status_code=400, detail="Either magnet link or torrent file is required")
+    
+    try:
+        if magnet:
+            torrent = await torrent_manager.add_magnet(magnet)
+        else:
+            content = await file.read()
+            torrent = await torrent_manager.add_torrent_file(content, file.filename)
+        
+        # Broadcast immediately that a new torrent was added
+        await broadcast_message({
+            "type": "torrent_added",
+            "data": {
+                "hash": torrent.hash,
+                "name": torrent.name,
+                "status": torrent.status.value,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return torrent
+    except Exception as e:
+        logger.error(f"Error adding torrent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/torrent/list", response_model=List[TorrentInfo])
+async def list_torrents(token: str = Depends(verify_token)):
+    """Get list of all torrents"""
+    return await torrent_manager.get_all_torrents()
+
+@app.get("/torrent/{torrent_hash}", response_model=TorrentInfo)
+async def get_torrent(torrent_hash: str, token: str = Depends(verify_token)):
+    """Get specific torrent info"""
+    torrent = await torrent_manager.get_torrent(torrent_hash)
+    if not torrent:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    return torrent
+
+@app.post("/torrent/{torrent_hash}/pause")
+async def pause_torrent(torrent_hash: str, token: str = Depends(verify_token)):
+    """Pause a torrent"""
+    success = await torrent_manager.pause_torrent(torrent_hash)
+    if not success:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    await broadcast_message({
+        "type": "torrent_paused",
+        "data": {
+            "hash": torrent_hash,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+    })
+    
+    return {"status": "paused"}
+
+@app.post("/torrent/{torrent_hash}/resume")
+async def resume_torrent(torrent_hash: str, token: str = Depends(verify_token)):
+    """Resume a torrent"""
+    success = await torrent_manager.resume_torrent(torrent_hash)
+    if not success:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    await broadcast_message({
+        "type": "torrent_resumed",
+        "data": {
+            "hash": torrent_hash,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+    })
+    
+    return {"status": "resumed"}
+
+@app.delete("/torrent/{torrent_hash}")
+async def remove_torrent(torrent_hash: str, delete_files: bool = False, token: str = Depends(verify_token)):
+    """Remove a torrent"""
+    success = await torrent_manager.remove_torrent(torrent_hash, delete_files)
+    if not success:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    await broadcast_message({
+        "type": "torrent_removed",
+        "data": {
+            "hash": torrent_hash,
+            "deleted_files": delete_files,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+    })
+    
+    return {"status": "removed"}
+
+# Cloud upload with real-time progress
+
+@app.post("/cloud/upload/{torrent_hash}")
+async def upload_to_cloud(
+    torrent_hash: str,
+    provider: CloudProvider,
+    token: str = Depends(verify_token)
+):
+    """Upload completed torrent to cloud storage with real-time progress"""
+    torrent = await torrent_manager.get_torrent(torrent_hash)
+    if not torrent:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    # ✅ Accept both completed and seeding torrents
+    if torrent.status not in [TorrentStatus.COMPLETED, TorrentStatus.SEEDING]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Torrent not ready for upload. Status: {torrent.status.value}. Must be completed or seeding."
+        )
+    
+    # ✅ Check if progress is 100% (for seeding torrents)
+    if torrent.progress < 100.0:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Torrent not fully downloaded. Progress: {torrent.progress:.1f}%"
+        )
+    
+    # Verify files actually exist
+    if not os.path.exists(torrent.save_path):
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Torrent files not found at: {torrent.save_path}"
+        )
+    
+    uploader = uploaders.get(provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    
+    # Rest of upload logic...
+    upload_id = f"{torrent_hash}_{provider.value}_{int(time.time())}"
+    
+    try:
+        await uploader.initialize()
+        
+        await broadcast_message({
+            "type": "cloud_upload_started",
+            "data": {
+                "upload_id": upload_id,
+                "hash": torrent_hash,
+                "provider": provider.value,
+                "torrent_name": torrent.name,
+                "total_size": torrent.size,
+                "file_path": torrent.save_path,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        result = await upload_with_progress(
+            uploader, 
+            torrent.save_path, 
+            torrent.name,
+            upload_id
+        )
+        
+        await database.add_upload_record(torrent_hash, provider.value, result["url"])
+        
+        await broadcast_message({
+            "type": "cloud_upload_completed",
+            "data": {
+                "upload_id": upload_id,
+                "hash": torrent_hash,
+                "provider": provider.value,
+                "url": result["url"],
+                "upload_size": result.get("size", 0),
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error uploading to cloud: {e}")
+        
+        await broadcast_message({
+            "type": "cloud_upload_failed",
+            "data": {
+                "upload_id": upload_id,
+                "hash": torrent_hash,
+                "provider": provider.value,
+                "error": str(e),
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def upload_with_progress(uploader, file_path: str, name: str, upload_id: str):
+    """Upload with real-time progress updates"""
+    
+    def progress_callback(bytes_transferred: int, total_bytes: int = None):
+        """Progress callback for cloud uploads"""
+        try:
+            progress_percent = (bytes_transferred / total_bytes * 100) if total_bytes else 0
+            
+            # Broadcast progress update
+            asyncio.create_task(broadcast_message({
+                "type": "cloud_upload_progress",
+                "data": {
+                    "upload_id": upload_id,
+                    "bytes_transferred": bytes_transferred,
+                    "total_bytes": total_bytes,
+                    "progress_percent": progress_percent,
+                    "timestamp": asyncio.get_event_loop().time()
+                }
+            }))
+        except Exception as e:
+            logger.debug(f"Progress callback error: {e}")
+    
+    # Enhance uploader with progress callback
+    if hasattr(uploader, 'set_progress_callback'):
+        uploader.set_progress_callback(progress_callback)
+    
+    # Upload file/folder
+    return await uploader.upload(file_path, name)
+
+
+# Enhanced cloud management endpoints
+
+@app.get("/cloud/uploads/active")
+async def get_active_uploads(token: str = Depends(verify_token)):
+    """Get currently active cloud uploads"""
+    # This would track active uploads in memory or database
+    # For now, return empty list
+    return []
+
+@app.delete("/cloud/upload/{upload_id}")
+async def cancel_upload(upload_id: str, token: str = Depends(verify_token)):
+    """Cancel an active cloud upload"""
+    # Implementation would depend on tracking active uploads
+    return {"status": "cancelled", "upload_id": upload_id}
+
+@app.get("/cloud/providers/status")
+async def get_cloud_providers_status(token: str = Depends(verify_token)):
+    """Get status of all configured cloud providers"""
+    providers_status = {}
+    
+    for provider_name, uploader in uploaders.items():
+        try:
+            is_available = await uploader.test_connection()
+            providers_status[provider_name.value] = {
+                "available": is_available,
+                "configured": True,
+                "last_test": asyncio.get_event_loop().time()
+            }
+        except Exception as e:
+            providers_status[provider_name.value] = {
+                "available": False,
+                "configured": False,
+                "error": str(e),
+                "last_test": asyncio.get_event_loop().time()
+            }
+    
+    return providers_status
+
+@app.post("/cloud/test/{provider}")
+async def test_cloud_provider(provider: CloudProvider, token: str = Depends(verify_token)):
+    """Test connection to specific cloud provider"""
+    uploader = uploaders.get(provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    
+    try:
+        result = await uploader.test_connection()
+        return {
+            "provider": provider.value,
+            "connected": result,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+    except Exception as e:
+        return {
+            "provider": provider.value,
+            "connected": False,
+            "error": str(e),
+            "timestamp": asyncio.get_event_loop().time()
+        }
+
+# Cloud file management endpoints
+
+@app.get("/cloud/{provider}/files")
+async def list_cloud_files(
+    provider: CloudProvider, 
+    path: str = "",
+    token: str = Depends(verify_token)
+):
+    """List files in cloud storage"""
+    uploader = uploaders.get(provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    
+    try:
+        files = await uploader.list_files(path)
+        return {
+            "provider": provider.value,
+            "path": path,
+            "files": files,
+            "count": len(files)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/cloud/{provider}/file")
+async def delete_cloud_file(
+    provider: CloudProvider,
+    file_id: str,
+    token: str = Depends(verify_token)
+):
+    """Delete a file from cloud storage"""
+    uploader = uploaders.get(provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    
+    try:
+        success = await uploader.delete_file(file_id)
+        if success:
+            await broadcast_message({
+                "type": "cloud_file_deleted",
+                "data": {
+                    "provider": provider.value,
+                    "file_id": file_id,
+                    "timestamp": asyncio.get_event_loop().time()
+                }
+            })
+        
+        return {"status": "deleted" if success else "failed", "file_id": file_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/cloud/{provider}/info/{file_id}")
+async def get_cloud_file_info(
+    provider: CloudProvider,
+    file_id: str,
+    token: str = Depends(verify_token)
+):
+    """Get file information from cloud storage"""
+    uploader = uploaders.get(provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    
+    try:
+        info = await uploader.get_file_info(file_id)
+        if not info:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        return {
+            "provider": provider.value,
+            "file_info": info
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Enhanced S3-specific endpoints (taking advantage of your advanced S3 implementation)
+
+@app.get("/cloud/s3/bucket/info")
+async def get_s3_bucket_info(token: str = Depends(verify_token)):
+    """Get S3 bucket information"""
+    s3_uploader = uploaders.get(CloudProvider.S3)
+    if not s3_uploader:
+        raise HTTPException(status_code=400, detail="S3 not configured")
+    
+    try:
+        info = await s3_uploader.get_bucket_info()
+        return info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/cloud/s3/presigned")
+async def generate_s3_presigned_url(
+    s3_key: str,
+    expiration: int = 3600,
+    token: str = Depends(verify_token)
+):
+    """Generate presigned URL for S3 file"""
+    s3_uploader = uploaders.get(CloudProvider.S3)
+    if not s3_uploader:
+        raise HTTPException(status_code=400, detail="S3 not configured")
+    
+    try:
+        url = await s3_uploader.generate_presigned_url(s3_key, expiration)
+        return {
+            "presigned_url": url,
+            "expiration": expiration,
+            "s3_key": s3_key
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Enhanced Google Drive specific endpoints
+
+@app.get("/cloud/gdrive/quota")
+async def get_gdrive_quota(token: str = Depends(verify_token)):
+    """Get Google Drive quota information"""
+    gdrive_uploader = uploaders.get(CloudProvider.GDRIVE)
+    if not gdrive_uploader:
+        raise HTTPException(status_code=400, detail="Google Drive not configured")
+    
+    try:
+        # This would require extending your GoogleDriveUploader
+        # with a get_quota() method
+        return {"message": "Quota endpoint - extend GoogleDriveUploader with get_quota()"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# LAN sync endpoints
+
+@app.get("/peer/list", response_model=List[PeerInfo])
+async def list_peers(token: str = Depends(verify_token)):
+    """Get list of discovered LAN peers"""
+    return await lan_sync.get_peers()
+
+@app.post("/peer/{peer_id}/pull/{torrent_hash}")
+async def pull_from_peer(peer_id: str, torrent_hash: str, token: str = Depends(verify_token)):
+    """Pull a torrent from a LAN peer"""
+    try:
+        result = await lan_sync.pull_torrent(peer_id, torrent_hash)
+        
+        await broadcast_message({
+            "type": "peer_pull_completed",
+            "data": {
+                "peer_id": peer_id,
+                "torrent_hash": torrent_hash,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error pulling from peer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Settings endpoints
+
+@app.get("/settings")
+async def get_settings(token: str = Depends(verify_token)):
+    """Get current settings"""
+    try:
+        # Convert to dict properly, excluding internal fields
+        settings_dict = {}
+        
+        # Get all the actual settings values, not the FieldInfo objects
+        for field_name, field_info in settings.__fields__.items():
+            value = getattr(settings, field_name, None)
+            settings_dict[field_name] = value
+            
+        return settings_dict
+        
+    except Exception as e:
+        logger.error(f"Error getting settings: {e}")
+        # Return a basic settings dict as fallback
+        return {
+            "api_key": "***hidden***",
+            "download_path": "./downloads",
+            "max_download_rate": 0,
+            "max_upload_rate": 0,
+            "max_connections": 200,
+            "max_uploads": 4,
+            "use_proxy": False,
+            "proxy_type": "socks5",
+            "proxy_host": "127.0.0.1",
+            "proxy_port": 9050,
+            "enable_encryption": False,
+            "lan_sync_enabled": True,
+            "device_name": "Hybrid Torrent Client",
+            "theme": "dark"
+        }
+
+@app.post("/settings")
+async def update_settings(new_settings: dict, token: str = Depends(verify_token)):
+    """Update settings"""
+    try:
+        # Update individual fields instead of calling settings.update()
+        for key, value in new_settings.items():
+            if hasattr(settings, key):
+                setattr(settings, key, value)
+        
+        # Update torrent manager if it exists and is running
+        if hasattr(torrent_manager, 'update_settings'):
+            await torrent_manager.update_settings(settings)
+        
+        await broadcast_message({
+            "type": "settings_updated",
+            "data": {
+                "updated_keys": list(new_settings.keys()),
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+            
+        return {"status": "updated", "message": "Settings updated successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error updating settings: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update settings: {str(e)}")
+
+# Statistics endpoint
+@app.get("/stats/bandwidth")
+async def get_bandwidth_stats(token: str = Depends(verify_token)):
+    """Get current bandwidth statistics"""
+    return await torrent_manager.get_bandwidth_stats()
+
+# WebSocket endpoint
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, api_key: Optional[str] = None):
+    """WebSocket for real-time updates"""
+    # Simple auth check for WebSocket
+    if api_key != settings.api_key:
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+    
+    await websocket.accept()
+    active_connections.append(websocket)
+    logger.info(f"WebSocket client connected. Total: {len(active_connections)}")
+    
+    try:
+        # Send initial data immediately
+        torrents = await torrent_manager.get_all_torrents()
+        bandwidth_stats = await torrent_manager.get_bandwidth_stats()
+        
+        initial_message = {
+            "type": "initial_data",
+            "data": {
+                "torrents": [
+                    {
+                        "hash": t.hash,
+                        "name": t.name,
+                        "size": t.size,
+                        "status": t.status.value,
+                        "progress": t.progress,
+                        "download_rate": t.download_rate,
+                        "upload_rate": t.upload_rate,
+                        "downloaded": t.downloaded,
+                        "uploaded": t.uploaded,
+                        "peers": t.peers,
+                        "seeds": t.seeds,
+                        "eta": t.eta,
+                        "save_path": t.save_path,
+                        "added_time": t.added_time.isoformat() if t.added_time else None,
+                        "completed_time": t.completed_time.isoformat() if t.completed_time else None
+                    } for t in torrents
+                ],
+                "stats": bandwidth_stats,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        }
+        
+        await websocket.send_text(json.dumps(initial_message, default=str))
+        
+        while True:
+            # Keep connection alive and handle incoming messages
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message.get("type") == "ping":
+                await websocket.send_text(json.dumps({
+                    "type": "pong",
+                    "timestamp": asyncio.get_event_loop().time()
+                }))
+                
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+            logger.info(f"WebSocket client disconnected. Total: {len(active_connections)}")
+
+# Additional API endpoints for better functionality
+
+@app.post("/torrent/{torrent_hash}/stop_seeding")
+async def stop_seeding(torrent_hash: str, token: str = Depends(verify_token)):
+    """Stop seeding and mark torrent as completed"""
+    try:
+        handle = torrent_manager.torrents.get(torrent_hash)
+        if not handle:
+            raise HTTPException(status_code=404, detail="Torrent not found")
+        
+        # Pause the torrent to stop seeding
+        if torrent_manager.use_real_libtorrent and hasattr(handle, 'pause'):
+            handle.pause()
+        
+        # Update status to completed instead of seeding
+        await database.update_torrent_status(torrent_hash, TorrentStatus.COMPLETED, 100.0)
+        
+        await broadcast_message({
+            "type": "torrent_completed",
+            "data": {
+                "hash": torrent_hash,
+                "status": "completed",
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {"status": "stopped_seeding", "message": "Torrent stopped seeding and marked as completed"}
+        
+    except Exception as e:
+        logger.error(f"Error stopping seeding: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/torrent/{torrent_hash}/mark_completed")
+async def mark_completed(torrent_hash: str, token: str = Depends(verify_token)):
+    """Mark a seeding torrent as completed for cloud upload"""
+    try:
+        # Get current torrent
+        torrent = await torrent_manager.get_torrent(torrent_hash)
+        if not torrent:
+            raise HTTPException(status_code=404, detail="Torrent not found")
+        
+        # Verify files exist
+        import os
+        if not os.path.exists(torrent.save_path):
+            raise HTTPException(status_code=400, detail="Torrent files not found")
+        
+        # Update database status to completed
+        await database.update_torrent_status(torrent_hash, TorrentStatus.COMPLETED, 100.0)
+        
+        await broadcast_message({
+            "type": "torrent_marked_completed",
+            "data": {
+                "hash": torrent_hash,
+                "name": torrent.name,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {
+            "status": "completed",
+            "message": "Torrent marked as completed and ready for cloud upload",
+            "ready_for_upload": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error marking completed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/torrent/{torrent_hash}/peers")
+async def get_torrent_peers(torrent_hash: str, token: str = Depends(verify_token)):
+    """Get peers for a specific torrent"""
+    # Mock peer data - replace with real implementation
+    return [
+        {
+            "ip": "192.168.1.100",
+            "port": 51234,
+            "client": "qBittorrent 4.5.0",
+            "progress": 0.85,
+            "download_rate": 1024 * 150,
+            "upload_rate": 1024 * 50,
+            "flags": "uE"
+        },
+        {
+            "ip": "10.0.0.25",
+            "port": 6881,
+            "client": "Transmission 3.0",
+            "progress": 0.92,
+            "download_rate": 1024 * 80,
+            "upload_rate": 1024 * 120,
+            "flags": "uD"
+        }
+    ]
+
+@app.get("/torrent/{torrent_hash}/trackers")
+async def get_torrent_trackers(torrent_hash: str, token: str = Depends(verify_token)):
+    """Get trackers for a specific torrent"""
+    # Mock tracker data - replace with real implementation
+    return [
+        {
+            "url": "http://tracker.example.com:8080/announce",
+            "tier": 0,
+            "source": "torrent",
+            "status": "working",
+            "last_announce": "2024-01-15T10:30:00Z",
+            "next_announce": "2024-01-15T11:00:00Z",
+            "seeders": 45,
+            "leechers": 12,
+            "downloaded": 1532
+        }
+    ]
+
+@app.get("/torrent/{torrent_hash}/pieces")
+async def get_torrent_pieces(torrent_hash: str, token: str = Depends(verify_token)):
+    """Get piece information for a specific torrent"""
+    # Mock piece data - replace with real implementation
+    return {
+        "piece_count": 1024,
+        "piece_size": 262144,  # 256KB
+        "completed_pieces": 512,
+        "partial_pieces": [
+            {"index": 513, "blocks_downloaded": 12, "total_blocks": 16},
+            {"index": 514, "blocks_downloaded": 8, "total_blocks": 16}
+        ]
+    }
+
+@app.post("/torrent/{torrent_hash}/reannounce")
+async def force_reannounce(torrent_hash: str, token: str = Depends(verify_token)):
+    """Force reannounce to trackers"""
+    handle = torrent_manager.torrents.get(torrent_hash)
+    if not handle:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    try:
+        if torrent_manager.use_real_libtorrent and hasattr(handle, 'force_reannounce'):
+            handle.force_reannounce()
+        
+        await broadcast_message({
+            "type": "torrent_reannounced",
+            "data": {
+                "hash": torrent_hash,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {"status": "reannounced"}
+    except Exception as e:
+        logger.error(f"Error forcing reannounce: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/torrent/{torrent_hash}/recheck")
+async def force_recheck(torrent_hash: str, token: str = Depends(verify_token)):
+    """Force recheck of torrent files"""
+    handle = torrent_manager.torrents.get(torrent_hash)
+    if not handle:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    try:
+        if torrent_manager.use_real_libtorrent and hasattr(handle, 'force_recheck'):
+            handle.force_recheck()
+        
+        await broadcast_message({
+            "type": "torrent_rechecking",
+            "data": {
+                "hash": torrent_hash,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {"status": "rechecking"}
+    except Exception as e:
+        logger.error(f"Error forcing recheck: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/torrent/{torrent_hash}/priority")
+async def set_torrent_priority(
+    torrent_hash: str, 
+    priority: int, 
+    token: str = Depends(verify_token)
+):
+    """Set torrent priority (0-255)"""
+    if not 0 <= priority <= 255:
+        raise HTTPException(status_code=400, detail="Priority must be between 0 and 255")
+    
+    success = await torrent_manager.set_torrent_priority(torrent_hash, priority)
+    if not success:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    return {"status": "priority_set", "priority": priority}
+
+@app.post("/torrent/{torrent_hash}/move")
+async def move_torrent_storage(
+    torrent_hash: str,
+    new_path: str,
+    token: str = Depends(verify_token)
+):
+    """Move torrent storage location"""
+    handle = torrent_manager.torrents.get(torrent_hash)
+    if not handle:
+        raise HTTPException(status_code=404, detail="Torrent not found")
+    
+    try:
+        # Ensure new path exists
+        os.makedirs(new_path, exist_ok=True)
+        
+        if torrent_manager.use_real_libtorrent and hasattr(handle, 'move_storage'):
+            handle.move_storage(new_path)
+        
+        await broadcast_message({
+            "type": "torrent_moved",
+            "data": {
+                "hash": torrent_hash,
+                "new_path": new_path,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {"status": "moved", "new_path": new_path}
+    except Exception as e:
+        logger.error(f"Error moving torrent storage: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# System information endpoints
+
+@app.get("/system/info")
+async def get_system_info(token: str = Depends(verify_token)):
+    """Get system information"""
+    import platform
+    import psutil
+    
+    try:
+        return {
+            "platform": platform.system(),
+            "platform_version": platform.version(),
+            "python_version": platform.python_version(),
+            "cpu_count": psutil.cpu_count(),
+            "memory_total": psutil.virtual_memory().total,
+            "memory_available": psutil.virtual_memory().available,
+            "disk_usage": {
+                "total": psutil.disk_usage(settings.download_path).total,
+                "free": psutil.disk_usage(settings.download_path).free,
+                "used": psutil.disk_usage(settings.download_path).used
+            },
+            "libtorrent_version": getattr(torrent_manager.lt, 'version', 'Mock') if torrent_manager.lt else 'Mock',
+            "using_real_libtorrent": torrent_manager.use_real_libtorrent
+        }
+    except ImportError:
+        # If psutil is not available, return basic info
+        return {
+            "platform": platform.system(),
+            "python_version": platform.python_version(),
+            "libtorrent_version": getattr(torrent_manager.lt, 'version', 'Mock') if torrent_manager.lt else 'Mock',
+            "using_real_libtorrent": torrent_manager.use_real_libtorrent
+        }
+
+@app.get("/logs/recent")
+async def get_recent_logs(lines: int = 100, token: str = Depends(verify_token)):
+    """Get recent log entries"""
+    # This would need to be implemented based on your logging setup
+    # For now, return a simple message
+    return {
+        "message": "Log retrieval not implemented yet",
+        "lines_requested": lines
+    }
+
+# Import os at the top if not already imported
+import os
+
+if __name__ == "__main__":
+    # Ensure required directories exist
+    os.makedirs(settings.download_path, exist_ok=True)
+    os.makedirs("./data", exist_ok=True)
+    os.makedirs("./logs", exist_ok=True)
+    
+    uvicorn.run(
+        "main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug,
+        log_level="info"
+    )

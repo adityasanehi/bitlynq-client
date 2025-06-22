@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Backend Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hybrid-torrent-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - API_KEY=dev-secret-key-change-in-production
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=true
+      - DOWNLOAD_PATH=/app/downloads
+      - MAX_DOWNLOAD_RATE=0
+      - MAX_UPLOAD_RATE=0
+      - LAN_SYNC_ENABLED=true
+      - LAN_SYNC_PORT=8001
+      - DEVICE_NAME=Hybrid Torrent Docker
+      - DATABASE_PATH=/app/data/hybrid_torrent.db
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+      - ./backend:/app
+    networks:
+      - torrent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend Service
+  frontend:
+      build:
+        context: ./frontend
+        dockerfile: Dockerfile
+      container_name: hybrid-torrent-frontend
+      ports:
+        - "3000:3000"
+      environment:
+        - NODE_ENV=development
+        - VITE_API_URL=http://localhost:8000  # Changed from REACT_APP_
+        - VITE_WS_URL=ws://localhost:8000     # Added WebSocket URL
+        - GENERATE_SOURCEMAP=false
+      volumes:
+        - ./frontend:/app
+        - /app/node_modules
+      networks:
+        - torrent-network
+      depends_on:
+        - backend
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:3000"]
+        interval: 30s
+        timeout: 10s
+        retries: 3
+        start_period: 60s
+
+networks:
+  torrent-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  downloads:
+    driver: local
+  data:
+    driver: local

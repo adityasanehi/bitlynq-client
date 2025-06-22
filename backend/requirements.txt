@@ -1,0 +1,62 @@
+# Core FastAPI dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+aiofiles==23.2.1
+websockets==12.0
+
+# Torrent engine
+libtorrent==2.0.11
+
+# Database
+aiosqlite==0.19.0
+databases[sqlite]==0.8.0
+
+# Cloud storage providers
+google-auth==2.23.4
+google-auth-oauthlib==1.1.0
+google-api-python-client==2.108.0
+boto3==1.38.41
+webdavclient3==3.14.6
+
+# LAN discovery and networking
+zeroconf==0.131.0
+aiohttp==3.9.1
+
+# Security and encryption
+cryptography==41.0.7
+pyjwt==2.8.0
+passlib[bcrypt]==1.7.4
+
+# Data validation and parsing
+pydantic==2.5.0
+pydantic-settings>=2.0.0
+
+# Utilities
+python-dotenv==1.0.0
+schedule==1.2.0
+psutil==5.9.6
+
+# Optional: For advanced features
+# qrcode[pil]==7.4.2  # QR code generation
+# watchdog==3.0.0     # File system monitoring
+# pillow==10.1.0      # Image processing
+
+# Development dependencies (optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Production dependencies
+gunicorn==21.2.0
+
+# # For advanced torrent search (if implementing search)
+# requests-html==0.10.0
+
+# # For better WebSocket handling in production
+# websocket-client==1.6.4
+
+# # For advanced scheduling features
+# APScheduler==3.10.4
