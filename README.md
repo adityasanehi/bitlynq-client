@@ -1,6 +1,6 @@
-# 🌊 BitLynq Torrent Client
+# BitLynq Torrent Client
 
-# ![BitLynq Logo](assets/logo.png)
+<img src="assets/logo.png" alt="BitLynq Logo" width="120"/>
 
 A modern, privacy-focused torrent client with **cloud storage sync**, **LAN sharing**, and **real-time torrent management**. BitLynq combines the power of libtorrent with a sleek React UI and a robust FastAPI backend — all containerized with Docker for effortless deployment.
 
