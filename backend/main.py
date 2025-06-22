@@ -29,13 +29,15 @@ logger = logging.getLogger(__name__)
 settings = Settings()
 database = Database()
 torrent_manager = TorrentManager(database)
-lan_sync = LANSync()
+
+# Initialize LAN sync with database reference
+lan_sync = LANSync(database)
 
 # Cloud uploaders
 uploaders = {
     CloudProvider.GDRIVE: GoogleDriveUploader(),
     CloudProvider.S3: S3Uploader(),
-    CloudProvider.WEBDAV: WebDAVUploader()
+    CloudProvider.WEBDAV: WebDAVUploader(settings)
 }
 
 # WebSocket connections
@@ -47,6 +49,11 @@ async def lifespan(app: FastAPI):
     # Startup
     await database.init()
     await torrent_manager.start()
+    
+    # Set torrent manager reference in LAN sync
+    lan_sync.set_torrent_manager(torrent_manager)
+    
+    # Start LAN sync
     await lan_sync.start()
     
     # Start background tasks
@@ -59,9 +66,10 @@ async def lifespan(app: FastAPI):
     await lan_sync.stop()
     await database.close()
 
+
 app = FastAPI(
-    title="Hybrid Torrent Client",
-    description="Privacy-respecting torrent client with cloud sync and LAN sharing",
+    title="BitLynq Client API",
+    description="Privacy-respecting torrent client with cloud sync and LAN sharing.",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -69,7 +77,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -295,7 +303,7 @@ async def remove_torrent(torrent_hash: str, delete_files: bool = False, token: s
 @app.post("/cloud/upload/{torrent_hash}")
 async def upload_to_cloud(
     torrent_hash: str,
-    provider: CloudProvider,
+    provider: str = Form(...),
     token: str = Depends(verify_token)
 ):
     """Upload completed torrent to cloud storage with real-time progress"""
@@ -303,33 +311,45 @@ async def upload_to_cloud(
     if not torrent:
         raise HTTPException(status_code=404, detail="Torrent not found")
     
-    # ✅ Accept both completed and seeding torrents
-    if torrent.status not in [TorrentStatus.COMPLETED, TorrentStatus.SEEDING]:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Torrent not ready for upload. Status: {torrent.status.value}. Must be completed or seeding."
-        )
-    
-    # ✅ Check if progress is 100% (for seeding torrents)
+    # ✅ Accept completed, seeding torrents, AND 100% progress regardless of status
     if torrent.progress < 100.0:
         raise HTTPException(
             status_code=400, 
-            detail=f"Torrent not fully downloaded. Progress: {torrent.progress:.1f}%"
+            detail=f"Torrent not fully downloaded. Progress: {torrent.progress:.1f}%. Must be 100% complete."
         )
     
     # Verify files actually exist
+    import os
     if not os.path.exists(torrent.save_path):
         raise HTTPException(
             status_code=404, 
             detail=f"Torrent files not found at: {torrent.save_path}"
         )
     
-    uploader = uploaders.get(provider)
-    if not uploader:
-        raise HTTPException(status_code=400, detail="Unsupported cloud provider")
+    # Map string provider to CloudProvider enum
+    provider_mapping = {
+        'gdrive': CloudProvider.GDRIVE,
+        'google_drive': CloudProvider.GDRIVE,
+        's3': CloudProvider.S3,
+        'amazon_s3': CloudProvider.S3,
+        'webdav': CloudProvider.WEBDAV
+    }
     
-    # Rest of upload logic...
-    upload_id = f"{torrent_hash}_{provider.value}_{int(time.time())}"
+    cloud_provider = provider_mapping.get(provider.lower())
+    if not cloud_provider:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported cloud provider: {provider}. Supported: {list(provider_mapping.keys())}"
+        )
+    
+    uploader = uploaders.get(cloud_provider)
+    if not uploader:
+        raise HTTPException(status_code=400, detail="Cloud provider not configured")
+    
+    # ✅ CRITICAL FIX: Update uploader settings before upload
+    uploader.settings = settings
+    
+    upload_id = f"{torrent_hash}_{provider}_{int(time.time())}"
     
     try:
         await uploader.initialize()
@@ -339,7 +359,7 @@ async def upload_to_cloud(
             "data": {
                 "upload_id": upload_id,
                 "hash": torrent_hash,
-                "provider": provider.value,
+                "provider": provider,
                 "torrent_name": torrent.name,
                 "total_size": torrent.size,
                 "file_path": torrent.save_path,
@@ -354,14 +374,14 @@ async def upload_to_cloud(
             upload_id
         )
         
-        await database.add_upload_record(torrent_hash, provider.value, result["url"])
+        await database.add_upload_record(torrent_hash, provider, result["url"], result.get("size", torrent.size))
         
         await broadcast_message({
             "type": "cloud_upload_completed",
             "data": {
                 "upload_id": upload_id,
                 "hash": torrent_hash,
-                "provider": provider.value,
+                "provider": provider,
                 "url": result["url"],
                 "upload_size": result.get("size", 0),
                 "timestamp": asyncio.get_event_loop().time()
@@ -378,14 +398,23 @@ async def upload_to_cloud(
             "data": {
                 "upload_id": upload_id,
                 "hash": torrent_hash,
-                "provider": provider.value,
+                "provider": provider,
                 "error": str(e),
                 "timestamp": asyncio.get_event_loop().time()
             }
         })
         
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+@app.get("/cloud/uploads/history")
+async def get_upload_history(token: str = Depends(verify_token)):
+    """Get cloud upload history"""
+    try:
+        uploads = await database.get_upload_history()
+        return uploads
+    except Exception as e:
+        logger.error(f"Error getting upload history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def upload_with_progress(uploader, file_path: str, name: str, upload_id: str):
     """Upload with real-time progress updates"""
@@ -675,6 +704,10 @@ async def update_settings(new_settings: dict, token: str = Depends(verify_token)
             if hasattr(settings, key):
                 setattr(settings, key, value)
         
+        # ✅ CRITICAL: Update uploader settings when settings change
+        for uploader in uploaders.values():
+            uploader.settings = settings
+        
         # Update torrent manager if it exists and is running
         if hasattr(torrent_manager, 'update_settings'):
             await torrent_manager.update_settings(settings)
@@ -692,6 +725,44 @@ async def update_settings(new_settings: dict, token: str = Depends(verify_token)
     except Exception as e:
         logger.error(f"Error updating settings: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update settings: {str(e)}")
+
+@app.post("/settings/reload")
+async def reload_settings(token: str = Depends(verify_token)):
+    """Reload settings for all components"""
+    try:
+        # Refresh uploader settings
+        for uploader in uploaders.values():
+            uploader.settings = settings
+        
+        # Test connections
+        connection_status = {}
+        for provider_name, uploader in uploaders.items():
+            try:
+                is_connected = await uploader.test_connection()
+                connection_status[provider_name.value] = {
+                    "connected": is_connected,
+                    "configured": True
+                }
+            except Exception as e:
+                connection_status[provider_name.value] = {
+                    "connected": False,
+                    "configured": False,
+                    "error": str(e)
+                }
+        
+        return {
+            "status": "reloaded",
+            "providers": connection_status,
+            "settings_summary": {
+                "webdav_configured": bool(settings.webdav_url and settings.webdav_username and settings.webdav_password),
+                "gdrive_configured": bool(settings.gdrive_credentials_path),
+                "s3_configured": bool(settings.s3_access_key and settings.s3_secret_key and settings.s3_bucket)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error reloading settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Statistics endpoint
 @app.get("/stats/bandwidth")
@@ -800,41 +871,266 @@ async def stop_seeding(torrent_hash: str, token: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Add this improved endpoint to your main.py to replace the existing mark_completed endpoint
+
 @app.post("/torrent/{torrent_hash}/mark_completed")
 async def mark_completed(torrent_hash: str, token: str = Depends(verify_token)):
-    """Mark a seeding torrent as completed for cloud upload"""
+    """Mark a seeding torrent as completed and stop seeding permanently"""
     try:
         # Get current torrent
         torrent = await torrent_manager.get_torrent(torrent_hash)
         if not torrent:
             raise HTTPException(status_code=404, detail="Torrent not found")
         
+        # Must be 100% downloaded
+        if torrent.progress < 100.0:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Torrent not fully downloaded. Progress: {torrent.progress:.1f}%"
+            )
+        
         # Verify files exist
         import os
         if not os.path.exists(torrent.save_path):
             raise HTTPException(status_code=400, detail="Torrent files not found")
         
+        # ✅ CRITICAL FIX: Properly stop seeding in libtorrent
+        handle = torrent_manager.torrents.get(torrent_hash)
+        if handle and torrent_manager.use_real_libtorrent:
+            try:
+                # Method 1: Remove torrent from session but keep files
+                logger.info(f"Removing torrent from session to stop seeding: {torrent_hash}")
+                torrent_manager.session.remove_torrent(handle)
+                
+                # Remove from active torrents dict
+                if torrent_hash in torrent_manager.torrents:
+                    del torrent_manager.torrents[torrent_hash]
+                    
+                logger.info(f"Successfully removed torrent from libtorrent session: {torrent_hash}")
+                
+            except Exception as lt_error:
+                logger.warning(f"Could not remove from libtorrent session: {lt_error}")
+                
+                # Fallback method: Just pause it
+                try:
+                    handle.pause()
+                    logger.info(f"Paused torrent as fallback: {torrent_hash}")
+                except Exception as pause_error:
+                    logger.warning(f"Could not pause torrent: {pause_error}")
+        
         # Update database status to completed
         await database.update_torrent_status(torrent_hash, TorrentStatus.COMPLETED, 100.0)
+        
+        # ✅ ALSO ADD: Mark in database that this torrent should not be resumed
+        metadata = {
+            "stopped_seeding": True,
+            "stopped_time": datetime.now().isoformat(),
+            "manual_stop": True
+        }
+        await database.update_torrent_metadata(torrent_hash, metadata)
         
         await broadcast_message({
             "type": "torrent_marked_completed",
             "data": {
                 "hash": torrent_hash,
                 "name": torrent.name,
+                "status": "completed",
+                "message": "Stopped seeding permanently",
                 "timestamp": asyncio.get_event_loop().time()
             }
         })
         
         return {
             "status": "completed",
-            "message": "Torrent marked as completed and ready for cloud upload",
-            "ready_for_upload": True
+            "message": "Torrent stopped seeding and marked as completed permanently",
+            "ready_for_upload": True,
+            "stopped_seeding": True
         }
         
     except Exception as e:
         logger.error(f"Error marking completed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ ALSO ADD: A separate endpoint for permanent stop seeding
+@app.post("/torrent/{torrent_hash}/stop_seeding")
+async def stop_seeding_permanently(torrent_hash: str, token: str = Depends(verify_token)):
+    """Permanently stop seeding a torrent"""
+    try:
+        # Get current torrent
+        torrent = await torrent_manager.get_torrent(torrent_hash)
+        if not torrent:
+            raise HTTPException(status_code=404, detail="Torrent not found")
+        
+        # Must be seeding or completed
+        if torrent.status not in [TorrentStatus.SEEDING, TorrentStatus.COMPLETED]:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Torrent must be seeding or completed to stop seeding. Current status: {torrent.status.value}"
+            )
+        
+        # ✅ PERMANENTLY remove from libtorrent session
+        handle = torrent_manager.torrents.get(torrent_hash)
+        if handle and torrent_manager.use_real_libtorrent:
+            try:
+                # Remove from session completely
+                torrent_manager.session.remove_torrent(handle)
+                logger.info(f"Removed torrent from libtorrent session: {torrent_hash}")
+            except Exception as e:
+                logger.warning(f"Could not remove from session: {e}")
+                # Try to pause as fallback
+                try:
+                    handle.pause()
+                except:
+                    pass
+        
+        # Remove from torrents dict so it won't be monitored
+        if torrent_hash in torrent_manager.torrents:
+            del torrent_manager.torrents[torrent_hash]
+            logger.info(f"Removed torrent from active monitoring: {torrent_hash}")
+        
+        # Update database
+        await database.update_torrent_status(torrent_hash, TorrentStatus.COMPLETED, torrent.progress)
+        
+        # Mark as permanently stopped
+        metadata = {
+            "stopped_seeding": True,
+            "stopped_time": datetime.now().isoformat(),
+            "manual_stop": True,
+            "final_status": "completed"
+        }
+        await database.update_torrent_metadata(torrent_hash, metadata)
+        
+        await broadcast_message({
+            "type": "torrent_seeding_stopped",
+            "data": {
+                "hash": torrent_hash,
+                "name": torrent.name,
+                "status": "completed",
+                "message": "Permanently stopped seeding",
+                "timestamp": asyncio.get_event_loop().time()
+            }
+        })
+        
+        return {
+            "status": "stopped",
+            "message": "Torrent seeding stopped permanently",
+            "new_status": "completed"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error stopping seeding: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ ENHANCED: Update the torrent manager to not resume stopped torrents
+# Add this method to your TorrentManager class in torrents.py
+
+async def resume_saved_torrents(self):
+    """Resume torrents from database - but skip manually stopped ones"""
+    try:
+        saved_torrents = await self.database.get_all_torrents()
+        
+        for torrent_data in saved_torrents:
+            try:
+                # ✅ SKIP torrents that were manually stopped from seeding
+                metadata = torrent_data.get("metadata", {})
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except:
+                        metadata = {}
+                
+                if metadata.get("stopped_seeding") or metadata.get("manual_stop"):
+                    logger.info(f"Skipping resume for manually stopped torrent: {torrent_data.get('name', 'Unknown')}")
+                    continue
+                
+                # Only resume if it was actively downloading or seeding
+                status = torrent_data.get("status", "")
+                if status in ["downloading", "seeding"] and torrent_data.get("magnet_link"):
+                    await self.add_magnet(torrent_data["magnet_link"])
+                    logger.info(f"Resumed torrent: {torrent_data.get('name', 'Unknown')}")
+                    
+            except Exception as e:
+                logger.error(f"Error resuming torrent: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error resuming saved torrents: {e}")
+
+
+# ✅ ALSO UPDATE: The monitoring loop to respect stopped torrents
+async def monitor_torrents(self):
+    """Monitor torrent status and update database - skip stopped ones"""
+    while self.running:
+        try:
+            for torrent_hash, handle in list(self.torrents.items()):
+                # ✅ CHECK: Skip monitoring if torrent was manually stopped
+                try:
+                    torrent_data = await self.database.get_torrent(torrent_hash)
+                    if torrent_data:
+                        metadata = torrent_data.get("metadata", {})
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except:
+                                metadata = {}
+                        
+                        if metadata.get("stopped_seeding") or metadata.get("manual_stop"):
+                            # Remove from monitoring
+                            logger.debug(f"Removing stopped torrent from monitoring: {torrent_hash}")
+                            continue
+                except Exception as db_error:
+                    logger.debug(f"Could not check torrent metadata: {db_error}")
+                
+                # Continue with normal monitoring for active torrents...
+                if not handle.is_valid():
+                    continue
+                
+                # [Rest of your existing monitoring code...]
+                status = handle.status()
+                progress = status.progress * 100
+                
+                # Determine current status
+                if status.paused:
+                    torrent_status = TorrentStatus.PAUSED
+                elif hasattr(status, 'error') and status.error:
+                    torrent_status = TorrentStatus.ERROR
+                elif hasattr(status, 'state'):
+                    if status.state == self.lt.torrent_status.checking_files:
+                        torrent_status = TorrentStatus.CHECKING
+                    elif status.state == self.lt.torrent_status.downloading_metadata:
+                        torrent_status = TorrentStatus.DOWNLOADING
+                    elif status.state == self.lt.torrent_status.downloading:
+                        torrent_status = TorrentStatus.DOWNLOADING
+                    elif status.state == self.lt.torrent_status.seeding:
+                        torrent_status = TorrentStatus.SEEDING
+                    elif status.state == self.lt.torrent_status.finished:
+                        torrent_status = TorrentStatus.COMPLETED
+                    else:
+                        torrent_status = TorrentStatus.QUEUED
+                else:
+                    torrent_status = TorrentStatus.DOWNLOADING
+                
+                # Update database with current status
+                await self.database.update_torrent_status(torrent_hash, torrent_status, progress)
+                
+                # Update metadata with current transfer stats
+                metadata = {
+                    "download_rate": getattr(status, 'download_rate', 0),
+                    "upload_rate": getattr(status, 'upload_rate', 0),
+                    "downloaded": getattr(status, 'total_wanted_done', 0),
+                    "uploaded": getattr(status, 'total_upload', 0),
+                    "peers": getattr(status, 'num_peers', 0),
+                    "seeds": getattr(status, 'num_seeds', 0),
+                    "last_updated": datetime.now().isoformat()
+                }
+                await self.database.update_torrent_metadata(torrent_hash, metadata)
+            
+            await asyncio.sleep(2)  # Update every 2 seconds
+            
+        except Exception as e:
+            logger.error(f"Error monitoring torrents: {e}")
+            await asyncio.sleep(5)
 
 @app.get("/torrent/{torrent_hash}/peers")
 async def get_torrent_peers(torrent_hash: str, token: str = Depends(verify_token)):

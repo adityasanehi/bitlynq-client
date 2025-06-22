@@ -10,10 +10,12 @@ import {
   XMarkIcon
 } from '@heroicons/react/24/outline';
 import { useTorrents } from '../context/TorrentContext';
+import { useWebSocket } from '../context/WebSocketContext';
 
 const Sidebar = ({ isOpen, onToggle, darkMode, onToggleTheme }) => {
   const location = useLocation();
   const { stats } = useTorrents();
+  const { ConnectionStatus } = useWebSocket();
 
   const navigation = [
     { 
@@ -65,11 +67,9 @@ const Sidebar = ({ isOpen, onToggle, darkMode, onToggleTheme }) => {
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
             <div className="flex items-center">
-              <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-                <span className="text-white font-bold text-sm">HT</span>
-              </div>
+              <img src="./logo.png" alt="Logo" className="w-8 h-8" />
               <h1 className="ml-3 text-lg font-semibold text-gray-900 dark:text-white">
-                Hybrid Torrent
+                BitLynq
               </h1>
             </div>
             <button
@@ -154,6 +154,8 @@ const Sidebar = ({ isOpen, onToggle, darkMode, onToggleTheme }) => {
           {/* Footer */}
           <div className="p-4 border-t border-gray-200 dark:border-gray-700">
             <div className="flex items-center justify-between">
+              
+              <ConnectionStatus />
               <span className="text-xs text-gray-500 dark:text-gray-400">
                 v1.0.0
               </span>

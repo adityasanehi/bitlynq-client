@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useTorrents } from '../context/TorrentContext';
-import { useWebSocket } from '../context/WebSocketContext';
 import TorrentList from '../components/TorrentList';
 import AddTorrentModal from '../components/AddTorrentModal';
 import StatsOverview from '../components/StatsOverview';
@@ -17,8 +16,6 @@ const Dashboard = () => {
     formatBytes,
     formatSpeed 
   } = useTorrents();
-  
-  const { ConnectionStatus } = useWebSocket();
   
   const [showAddModal, setShowAddModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -102,8 +99,6 @@ const Dashboard = () => {
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
-      <ConnectionStatus />
-      
       {/* Header */}
       <div className="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">

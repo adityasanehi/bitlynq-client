@@ -109,6 +109,12 @@ export const torrentAPI = {
   removeTorrent: (hash, deleteFiles = false) => 
     client.delete(`/torrent/${hash}?delete_files=${deleteFiles}`),
 
+  // ✅ NEW: Mark torrent as completed (stop seeding)
+  markCompleted: (hash) => client.post(`/torrent/${hash}/mark_completed`),
+
+  // ✅ NEW: Stop seeding
+  stopSeeding: (hash) => client.post(`/torrent/${hash}/stop_seeding`),
+
   // Get torrent pieces
   getTorrentPieces: (hash) => client.get(`/torrent/${hash}/pieces`),
 
@@ -137,21 +143,30 @@ export const torrentAPI = {
     client.post(`/torrent/${hash}/move`, { new_path: newPath }),
 };
 
-// Cloud API
+// ✅ FIXED: Cloud API with proper FormData handling
 export const cloudAPI = {
-  // Upload to cloud
-  uploadToCloud: (torrentHash, provider, destinationPath = null) => 
-    client.post(`/cloud/upload/${torrentHash}`, { 
-      provider, 
-      destination_path: destinationPath 
-    }),
+  // Upload to cloud - FIXED to use FormData like the backend expects
+  uploadToCloud: (torrentHash, provider) => {
+    const formData = new FormData();
+    formData.append('provider', provider);
+    return client.post(`/cloud/upload/${torrentHash}`, formData);
+  },
 
-  // Get upload history
-  getUploadHistory: () => client.get('/cloud/uploads'),
+  // ✅ NEW: Get upload history
+  getUploadHistory: () => client.get('/cloud/uploads/history'),
+
+  // ✅ NEW: Get active uploads
+  getActiveUploads: () => client.get('/cloud/uploads/active'),
+
+  // ✅ NEW: Cancel upload
+  cancelUpload: (uploadId) => client.delete(`/cloud/upload/${uploadId}`),
+
+  // ✅ NEW: Get cloud providers status
+  getProvidersStatus: () => client.get('/cloud/providers/status'),
 
   // Test cloud provider connection
   testCloudConnection: (provider) => 
-    client.post('/cloud/test', { provider }),
+    client.post(`/cloud/test/${provider}`),
 
   // Get cloud provider info
   getCloudProviderInfo: (provider) => 
@@ -159,11 +174,24 @@ export const cloudAPI = {
 
   // Delete cloud file
   deleteCloudFile: (provider, fileId) => 
-    client.delete(`/cloud/${provider}/file/${fileId}`),
+    client.delete(`/cloud/${provider}/file?file_id=${encodeURIComponent(fileId)}`),
 
   // List cloud files
   listCloudFiles: (provider, path = '') => 
     client.get(`/cloud/${provider}/files?path=${encodeURIComponent(path)}`),
+
+  // ✅ NEW: Get cloud file info
+  getCloudFileInfo: (provider, fileId) => 
+    client.get(`/cloud/${provider}/info/${encodeURIComponent(fileId)}`),
+
+  // ✅ NEW: S3 specific endpoints
+  getS3BucketInfo: () => client.get('/cloud/s3/bucket/info'),
+  
+  generateS3PresignedUrl: (s3Key, expiration = 3600) => 
+    client.post('/cloud/s3/presigned', { s3_key: s3Key, expiration }),
+
+  // ✅ NEW: Google Drive specific endpoints
+  getGDriveQuota: () => client.get('/cloud/gdrive/quota'),
 };
 
 // LAN Sync API
@@ -226,8 +254,8 @@ export const statsAPI = {
   // Get bandwidth stats
   getBandwidthStats: () => client.get('/stats/bandwidth'),
 
-  // Get system stats
-  getSystemStats: () => client.get('/stats/system'),
+  // ✅ NEW: Get system info
+  getSystemInfo: () => client.get('/system/info'),
 
   // Get historical stats
   getHistoricalStats: (hours = 24) => 
@@ -235,6 +263,9 @@ export const statsAPI = {
 
   // Get torrent statistics
   getTorrentStats: () => client.get('/stats/torrents'),
+
+  // ✅ NEW: Get recent logs
+  getRecentLogs: (lines = 100) => client.get(`/logs/recent?lines=${lines}`),
 };
 
 // Health API
@@ -269,6 +300,32 @@ export const searchAPI = {
   // Get recent torrents
   getRecentTorrents: (category = 'all', limit = 50) => 
     client.get(`/search/recent?category=${category}&limit=${limit}`),
+};
+
+// ✅ NEW: Utility functions for torrent status
+export const torrentUtils = {
+  // Check if torrent is ready for upload
+  isReadyForUpload: (torrent) => {
+    return torrent.progress >= 100.0;
+  },
+
+  // Get upload-ready torrents
+  getUploadReadyTorrents: (torrents) => {
+    return torrents.filter(torrent => torrent.progress >= 100.0);
+  },
+
+  // Get torrents by status
+  getTorrentsByStatus: (torrents, status) => {
+    return torrents.filter(torrent => torrent.status === status);
+  },
+
+  // Get completed torrents (both completed and seeding at 100%)
+  getCompletedTorrents: (torrents) => {
+    return torrents.filter(torrent => 
+      torrent.progress >= 100.0 && 
+      (torrent.status === 'completed' || torrent.status === 'seeding')
+    );
+  },
 };
 
 // Utility functions
@@ -329,6 +386,37 @@ export const utils = {
     
     return magnet;
   },
+
+  // ✅ NEW: Cloud provider utilities
+  getProviderIcon: (provider) => {
+    switch (provider) {
+      case 'gdrive':
+      case 'google_drive':
+        return '📁';
+      case 's3':
+      case 'amazon_s3':
+        return '☁️';
+      case 'webdav':
+        return '🌐';
+      default:
+        return '☁️';
+    }
+  },
+
+  getProviderName: (provider) => {
+    switch (provider) {
+      case 'gdrive':
+      case 'google_drive':
+        return 'Google Drive';
+      case 's3':
+      case 'amazon_s3':
+        return 'Amazon S3';
+      case 'webdav':
+        return 'WebDAV';
+      default:
+        return provider.toUpperCase();
+    }
+  },
 };
 
 // Export everything
@@ -340,5 +428,6 @@ export default {
   statsAPI,
   healthAPI,
   searchAPI,
+  torrentUtils,
   utils,
 };

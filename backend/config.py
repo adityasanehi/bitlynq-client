@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     debug: bool = False
     
     # Database
-    database_path: str = "hybrid_torrent.db"
+    database_path: str = "bitlynq.db"
     
     # Download settings
     download_path: str = "./downloads"
@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     # LAN sync
     lan_sync_enabled: bool = True
     lan_sync_port: int = 8001
-    device_name: str = "Hybrid Torrent Client"
-    mdns_service_name: str = "_hybrid_torrent._tcp.local."
+    device_name: str = "BitLynq Client"
+    mdns_service_name: str = "_bitlynq._tcp.local."
     
     # Cloud providers - Google Drive
     gdrive_credentials_path: Optional[str] = None

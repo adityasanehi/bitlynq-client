@@ -31,6 +31,7 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
   const [expandedTorrent, setExpandedTorrent] = useState(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(null);
   const [uploading, setUploading] = useState({});
+  const [showUploadModal, setShowUploadModal] = useState(null);
 
   const handlePauseResume = async (torrent) => {
     if (torrent.status === 'paused') {
@@ -45,8 +46,50 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
     setShowDeleteConfirm(null);
   };
 
-  // ✅ NEW: Handle stop seeding
+  // ✅ FIXED: Handle stop seeding with better error handling
   const handleStopSeeding = async (torrentHash) => {
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const API_KEY = import.meta.env.VITE_API_KEY || 'dev-secret-key-change-in-production';
+      
+      // Show confirmation dialog
+      const confirmed = window.confirm(
+        'Are you sure you want to stop seeding this torrent permanently? ' +
+        'This will remove it from the active torrent session but keep the files.'
+      );
+      
+      if (!confirmed) {
+        return;
+      }
+      
+      // Use the dedicated stop seeding endpoint
+      const response = await fetch(`${API_BASE_URL}/torrent/${torrentHash}/stop_seeding`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${API_KEY}`,
+        },
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        toast.success('Torrent stopped seeding permanently and marked as completed');
+        
+        // Optional: Show additional info
+        if (result.message) {
+          console.log('Stop seeding result:', result.message);
+        }
+      } else {
+        const error = await response.json();
+        toast.error(`Failed to stop seeding: ${error.detail || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error('Error stopping seeding:', error);
+      toast.error('Failed to stop seeding - check your connection');
+    }
+  };
+
+  // ✅ Alternative method for mark completed (for torrents that aren't seeding)
+  const handleMarkCompleted = async (torrentHash) => {
     try {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
       const API_KEY = import.meta.env.VITE_API_KEY || 'dev-secret-key-change-in-production';
@@ -59,19 +102,20 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
       });
       
       if (response.ok) {
-        toast.success('Torrent marked as completed - ready for upload');
-        // The WebSocket will automatically update the torrent status
+        const result = await response.json();
+        toast.success('Torrent marked as completed');
       } else {
         const error = await response.json();
         toast.error(`Failed to mark as completed: ${error.detail || 'Unknown error'}`);
       }
     } catch (error) {
-      console.error('Error stopping seeding:', error);
-      toast.error('Failed to stop seeding');
+      console.error('Error marking completed:', error);
+      toast.error('Failed to mark as completed - check your connection');
     }
   };
 
-  // ✅ NEW: Handle cloud upload
+
+  // ✅ FIXED: Cloud upload with proper form data
   const handleUploadToCloud = async (torrentHash, provider = 'gdrive') => {
     try {
       setUploading(prev => ({ ...prev, [torrentHash]: true }));
@@ -79,34 +123,37 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
       const API_KEY = import.meta.env.VITE_API_KEY || 'dev-secret-key-change-in-production';
       
+      // Use FormData to match backend expectations
+      const formData = new FormData();
+      formData.append('provider', provider);
+      
       const response = await fetch(`${API_BASE_URL}/cloud/upload/${torrentHash}`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${API_KEY}`,
         },
-        body: JSON.stringify({ provider }),
+        body: formData, // Send as form data, not JSON
       });
       
       if (response.ok) {
         const result = await response.json();
         toast.success(`Upload started to ${provider.toUpperCase()}`);
+        setShowUploadModal(null); // Close modal on success
       } else {
         const error = await response.json();
         toast.error(`Upload failed: ${error.detail || 'Unknown error'}`);
       }
     } catch (error) {
       console.error('Error uploading to cloud:', error);
-      toast.error('Failed to start upload');
+      toast.error('Failed to start upload - check your connection');
     } finally {
       setUploading(prev => ({ ...prev, [torrentHash]: false }));
     }
   };
 
-  // ✅ NEW: Check if torrent is ready for upload
+  // ✅ IMPROVED: Check if torrent is ready for upload (more permissive)
   const isReadyForUpload = (torrent) => {
-    return (torrent.status === 'completed' || torrent.status === 'seeding') && 
-           torrent.progress >= 100;
+    return torrent.progress >= 100.0; // Just check if 100% downloaded
   };
 
   const getProgressColor = (progress, status) => {
@@ -123,6 +170,130 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={iconPath} />
       </svg>
+    );
+  };
+
+  const renderActionButtons = (torrent) => {
+    const readyForUpload = isReadyForUpload(torrent);
+    
+    return (
+      <div className="mt-3 flex flex-wrap gap-2">
+        {/* Upload Button - for any 100% torrent */}
+        {readyForUpload && (
+          <button
+            onClick={() => setShowUploadModal(torrent.hash)}
+            disabled={uploading[torrent.hash]}
+            className="inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+          >
+            {uploading[torrent.hash] ? (
+              <>
+                <div className="animate-spin -ml-1 mr-1 h-3 w-3 border border-white border-t-transparent rounded-full"></div>
+                Uploading...
+              </>
+            ) : (
+              <>
+                <CloudArrowUpIcon className="w-3 h-3 mr-1" />
+                Upload to Cloud
+              </>
+            )}
+          </button>
+        )}
+        
+        {/* Stop Seeding Button - only for seeding torrents */}
+        {torrent.status === 'seeding' && (
+          <button
+            onClick={() => handleStopSeeding(torrent.hash)}
+            className="inline-flex items-center px-3 py-1 border border-red-300 dark:border-red-600 text-xs font-medium rounded-md text-red-700 dark:text-red-300 bg-white dark:bg-gray-700 hover:bg-red-50 dark:hover:bg-red-900/20"
+          >
+            <StopIcon className="w-3 h-3 mr-1" />
+            Stop Seeding
+          </button>
+        )}
+        
+        {/* Mark Completed Button - for other 100% torrents that aren't seeding */}
+        {readyForUpload && torrent.status !== 'seeding' && torrent.status !== 'completed' && (
+          <button
+            onClick={() => handleMarkCompleted(torrent.hash)}
+            className="inline-flex items-center px-3 py-1 border border-green-300 dark:border-green-600 text-xs font-medium rounded-md text-green-700 dark:text-green-300 bg-white dark:bg-gray-700 hover:bg-green-50 dark:hover:bg-green-900/20"
+          >
+            Mark Completed
+          </button>
+        )}
+      </div>
+    );
+  };
+
+
+  // ✅ NEW: Cloud upload modal component
+  const CloudUploadModal = ({ torrentHash, torrentName, onClose }) => {
+    const [selectedProvider, setSelectedProvider] = useState('gdrive');
+    
+    const providers = [
+      { value: 'gdrive', label: '📁 Google Drive', icon: '📁' },
+      { value: 's3', label: '☁️ Amazon S3', icon: '☁️' },
+      { value: 'webdav', label: '🌐 WebDAV', icon: '🌐' }
+    ];
+
+    return (
+      <div className="fixed inset-0 z-50 overflow-y-auto">
+        <div className="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+          <div className="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity" onClick={onClose}></div>
+          <div className="inline-block align-bottom bg-white dark:bg-gray-800 rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full">
+            <div className="bg-white dark:bg-gray-800 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+              <h3 className="text-lg leading-6 font-medium text-gray-900 dark:text-white mb-4">
+                Upload to Cloud Storage
+              </h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+                Choose where to upload "<strong>{torrentName}</strong>"
+              </p>
+              
+              <div className="space-y-3">
+                {providers.map(provider => (
+                  <label key={provider.value} className="flex items-center">
+                    <input
+                      type="radio"
+                      name="provider"
+                      value={provider.value}
+                      checked={selectedProvider === provider.value}
+                      onChange={(e) => setSelectedProvider(e.target.value)}
+                      className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                    />
+                    <span className="ml-3 text-sm text-gray-900 dark:text-white">
+                      {provider.label}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            
+            <div className="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+              <button
+                onClick={() => handleUploadToCloud(torrentHash, selectedProvider)}
+                disabled={uploading[torrentHash]}
+                className="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-blue-600 text-base font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 sm:ml-3 sm:w-auto sm:text-sm"
+              >
+                {uploading[torrentHash] ? (
+                  <>
+                    <div className="animate-spin -ml-1 mr-2 h-4 w-4 border-2 border-white border-t-transparent rounded-full"></div>
+                    Uploading...
+                  </>
+                ) : (
+                  <>
+                    <CloudArrowUpIcon className="w-4 h-4 mr-2" />
+                    Start Upload
+                  </>
+                )}
+              </button>
+              <button
+                onClick={onClose}
+                className="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-600 shadow-sm px-4 py-2 bg-white dark:bg-gray-700 text-base font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 sm:mt-0 sm:w-auto sm:text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     );
   };
 
@@ -193,38 +364,8 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
                 )}
               </div>
 
-              {/* ✅ NEW: Upload and Stop Seeding Actions */}
-              {readyForUpload && (
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <button
-                    onClick={() => handleUploadToCloud(torrent.hash)}
-                    disabled={uploading[torrent.hash]}
-                    className="inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
-                  >
-                    {uploading[torrent.hash] ? (
-                      <>
-                        <div className="animate-spin -ml-1 mr-1 h-3 w-3 border border-white border-t-transparent rounded-full"></div>
-                        Uploading...
-                      </>
-                    ) : (
-                      <>
-                        <CloudArrowUpIcon className="w-3 h-3 mr-1" />
-                        Upload to Cloud
-                      </>
-                    )}
-                  </button>
-                  
-                  {torrent.status === 'seeding' && (
-                    <button
-                      onClick={() => handleStopSeeding(torrent.hash)}
-                      className="inline-flex items-center px-3 py-1 border border-gray-300 dark:border-gray-600 text-xs font-medium rounded-md text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600"
-                    >
-                      <StopIcon className="w-3 h-3 mr-1" />
-                      Stop Seeding
-                    </button>
-                  )}
-                </div>
-              )}
+              {/* ✅ REPLACE: The existing upload and stop seeding actions section with this */}
+              {(isReadyForUpload(torrent) || torrent.status === 'seeding') && renderActionButtons(torrent)}
             </div>
 
             {/* Action Buttons */}
@@ -315,6 +456,15 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
             </div>
           )}
         </div>
+
+        {/* Upload Modal */}
+        {showUploadModal === torrent.hash && (
+          <CloudUploadModal
+            torrentHash={torrent.hash}
+            torrentName={torrent.name}
+            onClose={() => setShowUploadModal(null)}
+          />
+        )}
 
         {/* Delete Confirmation Modal */}
         {showDeleteConfirm === torrent.hash && (
@@ -433,10 +583,10 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
         
         <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
           <div className="flex justify-end space-x-2">
-            {/* ✅ NEW: Upload button for table view */}
+            {/* ✅ IMPROVED: Upload button for table view */}
             {readyForUpload && (
               <button
-                onClick={() => handleUploadToCloud(torrent.hash)}
+                onClick={() => setShowUploadModal(torrent.hash)}
                 disabled={uploading[torrent.hash]}
                 className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 disabled:opacity-50"
                 title="Upload to Cloud"
@@ -476,6 +626,17 @@ const TorrentList = ({ torrents, viewMode = 'list' }) => {
             </button>
           </div>
         </td>
+
+        {/* Upload Modal for table row */}
+        {showUploadModal === torrent.hash && (
+          <td colSpan="8">
+            <CloudUploadModal
+              torrentHash={torrent.hash}
+              torrentName={torrent.name}
+              onClose={() => setShowUploadModal(null)}
+            />
+          </td>
+        )}
 
         {/* Delete Confirmation Modal */}
         {showDeleteConfirm === torrent.hash && (
