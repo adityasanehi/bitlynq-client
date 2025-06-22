@@ -236,7 +236,7 @@ DEVICE_NAME=BitLynq
 
 ## 📄 License
 
-MIT License
+MIT License - https://mit-license.org
 
 ## 🙌 Credits
 
