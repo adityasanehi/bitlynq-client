@@ -1,4 +1,4 @@
-# BitLynq Torrent Client
+# 🔗 BitLynq Torrent Client
 
 <img src="assets/logo.png" alt="BitLynq Logo" width="240"/>
 
